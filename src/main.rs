@@ -5,20 +5,31 @@ use csv::ReaderBuilder;
 use hex;
 use reqwest::{Client, Url};
 use serde_json::Value;
+use std::sync::{RwLock,Arc};
 use std::{error::Error, str::FromStr};
 use types::{JsonRpcRequest, RpcError, RpcErrorCode, RpcResponse, Transaction};
-use utils::option_string_to_h160;
+use utils::{option_string_to_h160};
+use std::collections::HashSet;
 use warp::Filter;
 use web3::types::H160;
+use rusqlite::{params, Connection, Result};
 
 const ALERT_LIST_URL: &str = "https://raw.githubusercontent.com/forta-network/starter-kits/1131fb4a3221c611d931c7b212fb6a4077934d6b/scam-detector-py/manual_alert_list.tsv";
 
 #[tokio::main]
-async fn main() {
+  async fn main() {
     use std::sync::Arc;
 
     let alert_list = fetch_alert_list(ALERT_LIST_URL).await.unwrap();
     let alert_list_arc = Arc::new(alert_list);
+    let conn = match init_db(){
+        Ok(connection) => Arc::new(RwLock::new(connection)),
+        Err(e) => {
+            eprintln!("Error connecting to local db: {}", e);
+            return;
+        }
+    };
+
 
     let route = warp::path!("shield")
         .and(warp::post())
@@ -27,15 +38,18 @@ async fn main() {
         .clone()
         .then({
             let alert_list = Arc::clone(&alert_list_arc);
+            let conn = Arc::clone(&conn);
+
             move |request: JsonRpcRequest, rpc_param: String| {
                 let alert_list = Arc::clone(&alert_list);
+                let conn = Arc::clone(&conn);
                 let target = rpc_param
                     .split('=')
                     .skip(1)
                     .next()
                     .map(String::from)
                     .unwrap_or_else(|| "https://rpc-goerli.flashbots.net/fast".to_string());
-
+  
                 async move {
                     if let Err(_) = Url::from_str(&target) {
                         return warp::reply::with_status(
@@ -43,13 +57,22 @@ async fn main() {
                             warp::http::StatusCode::OK,
                         );
                     }
-                    handle_rpc_request(&request, &target, alert_list.to_vec()).await
+
+                 
+                
+                    handle_rpc_request(&request, &target, alert_list.to_vec(), &*co).await
                 }
             }
         });
+
     //start server
     warp::serve(route).run(([127, 0, 0, 1], 3030)).await;
-}
+}  
+
+
+
+
+
 
 // loads the suscpicious addresses list in memory
 async fn fetch_alert_list(url: &str) -> Result<Vec<H160>, Box<dyn Error>> {
@@ -109,6 +132,7 @@ async fn handle_eth_send_raw_transaction(
     req: &JsonRpcRequest,
     alert_list: Vec<H160>,
     target_endpoint: &str,
+    conn: &Connection,
 ) -> warp::reply::WithStatus<warp::reply::Json> {
     let raw_tx = req.params.get(0).unwrap();
     let tx = Transaction::new(&raw_tx).unwrap();
@@ -130,6 +154,37 @@ async fn handle_eth_send_raw_transaction(
         let json_response = warp::reply::json(&response);
         return warp::reply::with_status(json_response, warp::http::StatusCode::OK);
     }
+
+    // check to address agains known addresses for any vanity address
+
+
+    let cached_addresses = match fetch_cached_addresses(&conn) {
+        Ok(addresses) => addresses,
+        Err(e) => {
+            eprintln!("Error fetching cached addresses: {}", e);
+            HashSet::new()
+        }
+    };
+
+  
+    if is_vanity_address(&to_address, &cached_addresses) {
+        let response = RpcResponse::new(
+            None,
+            Some(RpcError {
+                code: RpcErrorCode::InvalidRequest.to_error_code(),
+                message: format!(
+                    "Interaction with a vanity address. To Address: {:?}",
+                    to_address
+                ),
+            }),
+        );
+
+        let json_response = warp::reply::json(&response);
+        return warp::reply::with_status(json_response, warp::http::StatusCode::OK);
+
+    }
+
+
     // if not malicious then proxy to target rpc
     let response = forward_request_to_target_rpc(&req, target_endpoint).await;
     let json_response;
@@ -149,10 +204,11 @@ async fn handle_rpc_request(
     req: &JsonRpcRequest,
     target_endpoint: &str,
     alert_list: Vec<H160>,
+    conn: &Connection,
 ) -> warp::reply::WithStatus<warp::reply::Json> {
     // catch raw txs
     if req.method == "eth_sendRawTransaction" {
-        return handle_eth_send_raw_transaction(req, alert_list, target_endpoint).await;
+        return handle_eth_send_raw_transaction(req, alert_list, target_endpoint, conn).await;
     }
     // default other calls to target rpc
     let response = forward_request_to_target_rpc(req, target_endpoint).await;
@@ -190,7 +246,7 @@ async fn forward_request_to_target_rpc(
                 })?;
                 Ok(json_response)
             } else {
-                Err("RPC request failed".into()) // Change this to an appropriate error type
+                Err("RPC request failed".into()) 
             }
         }
         Err(err) => Err(err.into()),
@@ -199,4 +255,76 @@ async fn forward_request_to_target_rpc(
 
 fn is_malicious_to_address(to_address: H160, alert_list: Vec<H160>) -> bool {
     return alert_list.contains(&to_address);
+}
+
+
+
+
+
+
+fn fetch_cached_addresses(conn: &Connection) -> Result<HashSet<H160>> {
+    let mut stmt = conn.prepare("SELECT address FROM cached_addresses")?;
+    let address_iter = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+    let mut cached_addresses = HashSet::new();
+    for address in address_iter {
+        match address {
+            Ok(addr) => {
+                if let Ok(h160_address) = H160::from_str(&addr) {
+                    cached_addresses.insert(h160_address);
+                }
+            }
+            Err(_) => continue, 
+        }
+    }
+
+    Ok(cached_addresses)
+}
+
+fn init_db() -> Result<Connection> {
+    let conn = Connection::open("to_addresses.db")?;
+
+  
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS to_addresses (
+            id INTEGER PRIMARY KEY,
+            address TEXT UNIQUE NOT NULL
+        )",
+        [],
+    )?;
+
+    Ok(conn)
+}
+
+fn is_vanity_address(address: &H160, cached_addresses: &HashSet<H160>) -> bool {
+    let address_str = format!("{:x}", address); 
+
+    for tolerance in 1..=12 {
+        for cached in cached_addresses {
+           
+            let cached_str = format!("{:x}", cached);
+
+            if cached_str != address_str && cached_str.len() > tolerance && address_str.len() > tolerance {
+                let cached_prefix = &cached_str[..tolerance];
+                let address_prefix = &address_str[..tolerance];
+                let cached_suffix = &cached_str[cached_str.len() - tolerance..];
+                let address_suffix = &address_str[address_str.len() - tolerance..];
+
+                
+                if cached_prefix == address_prefix && cached_suffix == address_suffix {
+                    return true; 
+                }
+            }
+        }
+    }
+
+    false 
+}
+
+fn insert_address(conn: &Connection, address: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO cached_addresses (address) VALUES (?1)",
+        params![address],
+    )?;
+    Ok(())
 }
