@@ -6,6 +6,3 @@ pub fn option_string_to_h160(opt_string: Option<String>) -> Option<H160> {
     })
 }
 
-pub fn option_to_string(option: Option<String>) -> String {
-    option.unwrap_or("default string".to_string())
-}

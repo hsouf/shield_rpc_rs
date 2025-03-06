@@ -3,77 +3,183 @@ mod utils;
 
 use csv::ReaderBuilder;
 use hex;
+
 use reqwest::{Client, Url};
 use serde_json::Value;
 use std::sync::{RwLock,Arc};
 use std::{error::Error, str::FromStr};
-use types::{JsonRpcRequest, RpcError, RpcErrorCode, RpcResponse, Transaction};
+use types::{JsonRpcRequest, RpcError, RpcErrorCode, RpcResponse};
 use utils::{option_string_to_h160};
 use std::collections::HashSet;
-use warp::Filter;
+use std::convert::Infallible;
+use warp::{Filter, Reply, Rejection};
 use web3::types::H160;
 use rusqlite::{params, Connection, Result};
+use serde::Deserialize;
+
+use ethers::types::{Transaction, H256};
 
 const ALERT_LIST_URL: &str = "https://raw.githubusercontent.com/forta-network/starter-kits/1131fb4a3221c611d931c7b212fb6a4077934d6b/scam-detector-py/manual_alert_list.tsv";
 
-#[tokio::main]
-  async fn main() {
-    use std::sync::Arc;
 
-    let alert_list = fetch_alert_list(ALERT_LIST_URL).await.unwrap();
-    let alert_list_arc = Arc::new(alert_list);
-    let conn = match init_db(){
-        Ok(connection) => Arc::new(RwLock::new(connection)),
+fn string_to_h160(address_str: &str) -> Result<H160, String> {
+    // Ensure the address is valid and properly formatted
+    // We expect the address to start with "0x" and have 40 characters after it
+    let full_address = address_str.trim(); // Remove any leading/trailing spaces
+    if !full_address.starts_with("0x") || full_address.len() != 42 {
+        return Err(format!("Invalid Ethereum address: {}", address_str));
+    }
+
+    // Now convert it to H160, ignoring the "0x" prefix
+    H160::from_str(&full_address[2..]).map_err(|_| format!("Failed to convert address '{}'", full_address))
+}
+
+#[tokio::main]
+async fn main() {
+    // Initialize shared state
+    let state = match AppState::new().await {
+        Ok(state) => Arc::new(state),
         Err(e) => {
-            eprintln!("Error connecting to local db: {}", e);
+            eprintln!("Failed to initialize application: {}", e);
             return;
         }
     };
+    let conn=get_db_conn();
 
 
-    let route = warp::path!("shield")
+
+  match create_table_if_not_exists(&conn) {
+        Ok(_) => println!("Table created or already exists."),
+        Err(e) => eprintln!("Error: {}", e), // Print error message if table creation fails
+    }
+
+      match insert_addresses(&conn, state.alert_list.to_vec()) {
+        Ok(_) => println!("Addresses inserted successfully."),
+        Err(e) => eprintln!("Error inserting addresses: {}", e),
+    }
+
+
+   
+    // Define the route
+    let shield_route = warp::path("shield")
         .and(warp::post())
         .and(warp::body::json())
-        .and(warp::query::raw())
-        .clone()
-        .then({
-            let alert_list = Arc::clone(&alert_list_arc);
-            let conn = Arc::clone(&conn);
+        .and(warp::query::<QueryParams>())
+        .and( with_db() )
+        .and_then(handle_shield_request);
+      
 
-            move |request: JsonRpcRequest, rpc_param: String| {
-                let alert_list = Arc::clone(&alert_list);
-                let conn = Arc::clone(&conn);
-                let target = rpc_param
-                    .split('=')
-                    .skip(1)
-                    .next()
-                    .map(String::from)
-                    .unwrap_or_else(|| "https://rpc-goerli.flashbots.net/fast".to_string());
-  
-                async move {
-                    if let Err(_) = Url::from_str(&target) {
-                        return warp::reply::with_status(
-                            warp::reply::json(&format!("Please provide a valid RPC URL")),
-                            warp::http::StatusCode::OK,
-                        );
-                    }
-
-                 
-                
-                    handle_rpc_request(&request, &target, alert_list.to_vec(), &*co).await
-                }
-            }
-        });
-
-    //start server
-    warp::serve(route).run(([127, 0, 0, 1], 3030)).await;
-}  
+    // Start server
+    warp::serve(shield_route)
+        .run(([127, 0, 0, 1], 3030))
+        .await;
+}
 
 
+pub fn create_table_if_not_exists(conn: &Connection) -> Result<(), String> {
+    // Attempt to execute the SQL query to create the table if it doesn't exist
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS malicious_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+  address CHAR(50) UNIQUE NOT NULL
+        )",
+        [], // No parameters for the query
+    ).map_err(|e| {
+        // Return a detailed error message if something goes wrong
+        format!("Error creating table 'addresses': {}", e)
+    })?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cached_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+     address CHAR(50) UNIQUE NOT NULL
+        )",
+        [], // No parameters for the query
+    ).map_err(|e| {
+        // Return a detailed error message if something goes wrong
+        format!("Error creating table 'addresses': {}", e)
+    })?;
+
+    Ok(())
+}
+
+
+fn with_db() -> impl Filter<Extract = (Connection,), Error = Infallible> + Clone {
+    warp::any().map(|| get_db_conn())
+}
+
+
+
+pub fn get_db_conn()->Connection{
+    let conn = Connection::open("to_addresses.db").expect("Failed to open SQLite connection");
+    conn
+}
 
 
 
 
+
+async fn handle_shield_request(
+    request: JsonRpcRequest,
+    params: QueryParams,  
+    conn: Connection,
+) -> Result<impl Reply, Rejection>{
+    let target = params.target
+        .unwrap_or_else(|| "https://rpc-goerli.flashbots.net/fast".to_string()); // use default rp if target not provided
+
+    if Url::parse(&target).is_err() {
+        return Ok(warp::reply::with_status(
+            warp::reply::json(&"Please provide a valid RPC URL"),
+            warp::http::StatusCode::OK,
+        ));
+    }
+    
+
+    let reply = handle_rpc_request(&request, &target, conn).await;
+    Ok(reply)
+}
+
+#[derive(Debug)]
+struct ServerError;
+
+impl warp::reject::Reject for ServerError {}
+
+#[derive(Deserialize)]
+struct QueryParams {
+    target: Option<String>,
+}
+// Application state
+struct AppState {
+    alert_list: Arc<Vec<H160>>,
+    db: Arc<RwLock<Connection>>,
+}
+
+
+
+impl AppState {
+    async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            alert_list: Arc::new(fetch_alert_list(ALERT_LIST_URL).await.unwrap()),
+            db: Arc::new(RwLock::new(Connection::open_in_memory()?)),
+        })
+    }
+}
+pub fn insert_addresses(conn: &Connection, addresses: Vec<H160>) -> Result<(), String> {
+    let mut stmt = conn.prepare("INSERT OR IGNORE INTO malicious_addresses (address) VALUES (?1)")
+        .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+    for address in addresses {
+        let result = stmt.execute(params![format!("0x{}", encode(address.as_bytes()))])
+            .map_err(|e| format!("Failed to insert address {}: {}", address, e));
+
+        if let Err(err) = result {
+            return Err(err);
+        }
+    }
+
+    // Return Ok if all addresses were successfully inserted
+    Ok(())
+}
 // loads the suscpicious addresses list in memory
 async fn fetch_alert_list(url: &str) -> Result<Vec<H160>, Box<dyn Error>> {
     let response = reqwest::get(url).await?.bytes().await?;
@@ -127,19 +233,30 @@ async fn fetch_alert_list(url: &str) -> Result<Vec<H160>, Box<dyn Error>> {
 
     Ok(alert_list)
 }
-
+use ethers::utils::{ rlp};
+use hex::encode;
 async fn handle_eth_send_raw_transaction(
     req: &JsonRpcRequest,
-    alert_list: Vec<H160>,
     target_endpoint: &str,
-    conn: &Connection,
+    conn: Connection,
 ) -> warp::reply::WithStatus<warp::reply::Json> {
     let raw_tx = req.params.get(0).unwrap();
-    let tx = Transaction::new(&raw_tx).unwrap();
-    let to_address = option_string_to_h160(tx.to).unwrap();
+  //let tx = Transaction::from_str (&raw_tx);
+    //let to_address = option_string_to_h160(tx.to).unwrap();
+
+    let raw_tx_no_prefix = &raw_tx[2..];
+    let rlp_data = hex::decode(raw_tx_no_prefix).unwrap();
+    let tx: Transaction = rlp::decode(&rlp_data).unwrap();
+
+   let to_address=tx.to.unwrap();
+  
+
+
 
     // if malicious interaction return error and don't forward tx to target rpc
-    if is_malicious_to_address(to_address, alert_list) {
+    let is_malicious= is_malicious_address( &conn, to_address).unwrap();
+
+    if is_malicious{
         let response = RpcResponse::new(
             None,
             Some(RpcError {
@@ -153,7 +270,7 @@ async fn handle_eth_send_raw_transaction(
 
         let json_response = warp::reply::json(&response);
         return warp::reply::with_status(json_response, warp::http::StatusCode::OK);
-    }
+    } 
 
     // check to address agains known addresses for any vanity address
 
@@ -166,8 +283,12 @@ async fn handle_eth_send_raw_transaction(
         }
     };
 
+   
+        
+    
+
   
-    if is_vanity_address(&to_address, &cached_addresses) {
+   if is_vanity_address(&to_address, &cached_addresses) {
         let response = RpcResponse::new(
             None,
             Some(RpcError {
@@ -182,7 +303,15 @@ async fn handle_eth_send_raw_transaction(
         let json_response = warp::reply::json(&response);
         return warp::reply::with_status(json_response, warp::http::StatusCode::OK);
 
-    }
+    } 
+
+    // cache address if all ok
+    match insert_address(&conn, &format!("0x{}", encode(to_address.as_bytes())))
+        {
+            Ok(_) => println!("cached new address"),
+            Err(e) => eprintln!("Error: {}", e), // Print error message if table creation fails
+        }
+    
 
 
     // if not malicious then proxy to target rpc
@@ -203,12 +332,11 @@ async fn handle_eth_send_raw_transaction(
 async fn handle_rpc_request(
     req: &JsonRpcRequest,
     target_endpoint: &str,
-    alert_list: Vec<H160>,
-    conn: &Connection,
+    conn: Connection,
 ) -> warp::reply::WithStatus<warp::reply::Json> {
     // catch raw txs
     if req.method == "eth_sendRawTransaction" {
-        return handle_eth_send_raw_transaction(req, alert_list, target_endpoint, conn).await;
+        return handle_eth_send_raw_transaction(req, target_endpoint, conn).await;
     }
     // default other calls to target rpc
     let response = forward_request_to_target_rpc(req, target_endpoint).await;
@@ -253,9 +381,7 @@ async fn forward_request_to_target_rpc(
     }
 }
 
-fn is_malicious_to_address(to_address: H160, alert_list: Vec<H160>) -> bool {
-    return alert_list.contains(&to_address);
-}
+
 
 
 
@@ -269,12 +395,14 @@ fn fetch_cached_addresses(conn: &Connection) -> Result<HashSet<H160>> {
     let mut cached_addresses = HashSet::new();
     for address in address_iter {
         match address {
-            Ok(addr) => {
-                if let Ok(h160_address) = H160::from_str(&addr) {
+            Ok(addr) => {        
+                if let Ok(h160_address) = string_to_h160(&addr) {
                     cached_addresses.insert(h160_address);
+                }else{
+                    eprintln!("not ok addr: {}", addr);  
                 }
             }
-            Err(_) => continue, 
+            Err(e) => {eprintln!("Error fetching cached: {}", e)}, 
         }
     }
 
@@ -288,7 +416,7 @@ fn init_db() -> Result<Connection> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS to_addresses (
             id INTEGER PRIMARY KEY,
-            address TEXT UNIQUE NOT NULL
+        address CHAR(50) UNIQUE NOT NULL
         )",
         [],
     )?;
@@ -301,7 +429,7 @@ fn is_vanity_address(address: &H160, cached_addresses: &HashSet<H160>) -> bool {
 
     for tolerance in 1..=12 {
         for cached in cached_addresses {
-           
+     
             let cached_str = format!("{:x}", cached);
 
             if cached_str != address_str && cached_str.len() > tolerance && address_str.len() > tolerance {
@@ -321,10 +449,32 @@ fn is_vanity_address(address: &H160, cached_addresses: &HashSet<H160>) -> bool {
     false 
 }
 
-fn insert_address(conn: &Connection, address: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO cached_addresses (address) VALUES (?1)",
-        params![address],
-    )?;
+fn insert_address(conn: &Connection, address: &str) -> Result<(), String> {
+ 
+
+    let mut stmt = conn.prepare("INSERT OR IGNORE INTO cached_addresses (address) VALUES (?1)")
+    .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+eprintln!(" insert ====: {}", address);
+
+    let result = stmt.execute(params![address])
+        .map_err(|e| format!("Failed to insert address {}: {}", address, e));
+
+    if let Err(err) = result {
+        return Err(err);
+    }
+
+
     Ok(())
 }
+
+pub fn is_malicious_address(conn: &Connection, address: H160) -> Result<bool> {
+
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM malicious_addresses WHERE address = ?1")?;
+    
+    let count: i64 = stmt.query_row(params![format!("0x{}", encode(address.as_bytes()))], |row| row.get(0))?;
+    
+
+    Ok(count > 0)
+}
+
