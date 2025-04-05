@@ -33,7 +33,7 @@ cargo run
 
 ## TO DO
 
-- [ ] Prevent address poisoning attacks by blocking any interaction with vanity addresses.
+- [x] Prevent address poisoning attacks by blocking any interaction with vanity addresses.
 - [ ] Add a wait time for txs before they get forwarded in case you changed your mind at the last minute (just like emails but better)
 - [ ] Real-time update of the alert list
 
