@@ -4,16 +4,12 @@ mod state;
 mod filters;
 mod proxy;
 
-
-
-
-
 use state::*;
 use proxy::QueryParams;
 use proxy::shield;
 use warp::Filter;
 
-
+// our defualt private rpc
 pub const DEFAULT_RPC: &str ="https://rpc-goerli.flashbots.net/fast";
 
 
@@ -35,8 +31,7 @@ async fn main() {
             return;
         }
     }
-
-    // Define the route
+    
     let shield_route = warp::path("shield")
         .and(warp::post())
         .and(warp::body::json())
@@ -45,7 +40,7 @@ async fn main() {
         .and_then(shield);
       
 
-    // Start server
+    // start the server
     warp::serve(shield_route)
         .run(([127, 0, 0, 1], 3030))
         .await;

@@ -19,7 +19,6 @@ pub struct RpcResponse<'a> {
     pub error: Option<RpcError>,
 }
 impl<'a> RpcResponse<'a> {
-    // Constructor to create a new RpcResponse with default values
     pub fn new(result: Option<&'a str>, error: Option<RpcError>) -> Self {
         RpcResponse {
             id: 2,
