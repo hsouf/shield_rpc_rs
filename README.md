@@ -11,13 +11,7 @@ Types of addresses that should be blocked:
  
 - Right now for the POC I'm using the alert list genereously put together [here](https://github.com/forta-network/starter-kits/blob/1131fb4a3221c611d931c7b212fb6a4077934d6b/scam-detector-py/manual_alert_list.tsv#L177) by Certik, AegisWeb3, Peckshield, Blocksec...
 
-Example:
-```
-http://localhost:3030/shield?rpc=https://rpc-goerli.flashbots.net/hint=hash
-``````
 
-
-![rpc drawio](https://github.com/user-attachments/assets/0eed09c5-b0de-4128-8267-e32345d441ea)
 
 ### Running locally
 
@@ -30,6 +24,11 @@ Run project
 `````
 cargo run
 `````
+Start proxy:
+
+```
+http://localhost:3030/shield?rpc=YOUR_PRIVATE_RPC
+``````
 
 ## TO DO
 
